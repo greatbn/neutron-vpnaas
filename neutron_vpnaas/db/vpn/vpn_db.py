@@ -468,7 +468,20 @@ class VPNPluginDb(vpnaas.VPNPluginBase,
                'external_v4_ip': vpnservice['external_v4_ip'],
                'external_v6_ip': vpnservice['external_v6_ip'],
                'status': vpnservice['status']}
+        if vpnservice.qos_info:
+            res['qos_policy_id'] = vpnservice.qos_info[0].qos_policy_id
         return self._fields(res, fields)
+
+    def _process_qos_create_vpn(self, context, vpns, vpnservice_db):
+        qos_plugin = directory.get_plugin(p_constants.QOS)
+        if not qos_plugin:
+            raise vpnaas.QosNotEnableForVPN()
+        self._check_supported_vpn_qos(
+            context, qos_plugin, vpns['qos_policy_id'])
+        assoc_qos_db = vpn_models.QosVPNServerPolicyBinding(
+            vpn_service_id=vpnservice_db.id,
+            qos_policy_id='qos_policy_id')
+        context.session.add(assoc_qos_db)
 
     def create_vpnservice(self, context, vpnservice):
         vpns = vpnservice['vpnservice']
@@ -487,7 +500,27 @@ class VPNPluginDb(vpnaas.VPNPluginBase,
                 admin_state_up=vpns['admin_state_up'],
                 status=lib_constants.PENDING_CREATE)
             context.session.add(vpnservice_db)
+            if 'qos_policy_id' in vpns:
+                if vpns['qos_policy_id']:
+                    self._process_qos_create_vpn(context, vpns, vpnservice_db)
         return self._make_vpnservice_dict(vpnservice_db)
+
+    def _check_supported_vpn_qos(self, context, plugin, qos_policy_id):
+        try:
+            qos_policy_details = plugin.get_policy(context, qos_policy_id)
+        except Exception:
+            raise vpnaas.QosPolicyForVPNNotFound(qos_policy_id=qos_policy_id)
+        for rule in qos_policy_details['rules']:
+            if rule['type'] not in v_constants.VPN_SUPPORTED_QOS_RULE_TYPES:
+                raise vpnaas.NotSuportedQosPolicyRule(
+                    type=rule['type'], qos_policy_id=qos_policy_id,
+                    supported_types=v_constants.VPN_SUPPORTED_QOS_RULE_TYPES
+                )
+            # TODO(zhaobo) this check could be removed if there are any
+            # requirements towards ingress vpn traffic
+            if rule['direction'] != 'egress':
+                raise vpnaas.NotSupportedQosBwRuleDirection(
+                    direction=rule['direction'], qos_policy_id=qos_policy_id)
 
     def set_external_tunnel_ips(self, context, vpnservice_id, v4_ip=None,
                                 v6_ip=None):
@@ -499,6 +532,32 @@ class VPNPluginDb(vpnaas.VPNPluginBase,
             vpns_db.update(vpns)
         return self._make_vpnservice_dict(vpns_db)
 
+    def _process_qos_update_vpn(self, context, vpns, vpns_db):
+        if vpns['qos_policy_id']:
+            qos_plugin = directory.get_plugin(p_constants.QOS)
+            if not qos_plugin:
+                raise vpnaas.QosNotEnableForVPN()
+            if not vpns_db.qos_info or (
+                vpns_db.qos_info[0].qos_policy_id != vpns['qos_policy_id']):
+                self._check_supported_vpn_qos(
+                    context, qos_plugin, vpns['qos_policy_id'])
+                try:
+                    vpn_binding = context.session.query(
+                        vpn_models.QosVPNServerPolicyBinding).filter(
+                            vpn_models.QosVPNServerPolicyBinding.vpn_service_id == vpns_db.id
+                            ).one()
+                    vpn_binding.qos_policy_id = vpns['qos_policy_id']
+                    context.session.add(vpn_binding)
+                except exc.NoResultFound:
+                    assoc_qos_db = vpn_models.QosVPNServerPolicyBinding(
+                        vpn_service_id=vpns_db.id,
+                        qos_policy_id=vpns['qos_policy_id'])
+                    context.session.add(assoc_qos_db)
+
+        else:
+            if vpns_db.qos_info:
+                context.session.delete(vpns_db.qos_info[0])
+
     def update_vpnservice(self, context, vpnservice_id, vpnservice):
         vpns = vpnservice['vpnservice']
         with context.session.begin(subtransactions=True):
@@ -507,6 +566,9 @@ class VPNPluginDb(vpnaas.VPNPluginBase,
             self.assert_update_allowed(vpns_db)
             if vpns:
                 vpns_db.update(vpns)
+                if 'qos_policy_id' in vpns:
+                    if vpns['qos_policy_id']:
+                        self._process_qos_update_vpn(context, vpns, vpns_db)
         return self._make_vpnservice_dict(vpns_db)
 
     def delete_vpnservice(self, context, vpnservice_id):

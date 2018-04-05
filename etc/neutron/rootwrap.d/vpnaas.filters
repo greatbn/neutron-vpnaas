@@ -17,3 +17,24 @@ strongswan: CommandFilter, strongswan, root
 neutron_netns_wrapper: CommandFilter, neutron-vpn-netns-wrapper, root
 neutron_netns_wrapper_local: CommandFilter, /usr/local/bin/neutron-vpn-netns-wrapper, root
 chown: RegExpFilter, chown, root, chown, --from=.*, root.root, .*/(ipsec.secrets|ipsec/[0-9a-z-]+/log)
+
+# htb_tc_lib
+htb_tc_show_qdiscs: RegExpFilter, tc, root, tc, qdisc, show, dev, .+
+htb_tc_get_qdiscs_details: RegExpFilter, tc, root, tc, -s, -d, qdisc, show, dev, .+
+htb_tc_get_classes: RegExpFilter, tc, root, tc, class, show, dev, .+
+htb_tc_get_classes_details: RegExpFilter, tc, root, tc, -s, -d, class, show, dev, .+
+htb_tc_get_filters: RegExpFilter, tc, root, tc, -p, -s, -d, filter, show, dev, .+, parent, .+
+htb_tc_add_root_qdisc_egress: RegExpFilter, tc, root, tc, qdisc, add, dev, .+, root, handle, 1:, htb, default, 100
+htb_tc_add_root_qdisc_ingress: RegExpFilter, tc, root, tc, qdisc, add, dev, .+, ingress
+htb_tc_add_main_class: RegExpFilter, tc, root, tc, class, replace, dev, .+, parent, .+, classid, .+, htb, rate, .+, ceil, .+, burst, .+, prio, 1
+htb_tc_add_sub_class: RegExpFilter, tc, root, tc, class, replace, dev, .+, parent, .+, classid, .+, htb, rate, .+, ceil, .+, burst, .+, prio, .+
+htb_tc_set_qdisc_scheduling_on_class: RegExpFilter, tc, root, tc, qdisc, add, dev, .+, classid, .+, prio, 1, handle, .+, sfq, perturb, 10
+htb_tc_add_filter_by_fwmark: RegExpFilter, tc, root, tc, filter, replace, dev, .+, classid, .+, prio, 1, handle, .+, fw, flowid, .+
+#htb_tc_add_filter_by_u32: RegExpFilter, tc, root, tc, filter, replace, dev, .+, parent, .+, protocol, .+, prio, 1, u32, .* flowid .+
+#htb_tc_add_filter_by_u32: RegExpFilter, tc, root, tc, filter, replace, dev, .+, parent, .+, protocol, ip, prio, 1, u32, (match ip (protocol|src|dst|sport|dport) .+)+, flowid, .+
+#htb_tc_add_filter_by_u32: RegExpFilter, tc, root, tc filter replace dev .+ parent .+ protocol ip prio 1 u32 (match ip (protocol|src|dst|sport|dport) .+)+ flowid .+
+htb_tc_add_filter_by_u32_vpn_egress: RegExpFilter, tc, root, tc, filter, replace, dev, .+, parent, .+, protocol, ip, prio, 1, u32, match, ip, protocol, .+, .+, match, ip, src, .+, flowid, .+
+htb_tc_add_filter_by_u32_vpn_egress: RegExpFilter, tc, root, tc, filter, replace, dev, .+, parent, .+, protocol, ip, prio, 1, handle, .+, u32, match, ip, protocol, .+, .+, match, ip, src, .+, flowid, .+
+htb_tc_del_filter_by_id: RegExpFilter, tc, root, tc, filter, del, dev, .+, parent, .+, prio, 1, handle, .+, u32
+htb_tc_del_class_by_id: RegExpFilter, tc, root, tc, class, del, dev, .+, classid, .+
+htb_tc_del_root_qdisc: RegExpFilter, tc, root, tc, qdisc, del, dev, .+, root
