@@ -170,6 +170,27 @@ class EndpointGroupInUse(nexception.BadRequest):
     message = _("Endpoint group %(group_id)s is in use and cannot be deleted")
 
 
+class QosPolicyForVPNNotFound(nexception.NotFound):
+    message = _("Can not Found %(qos_policy_id)s for VPN Service")
+
+
+class NotSuportedQosPolicyRule(nexception.InvalidInput):
+    message = _("Not Supported Qos Policy Rule type %(type)s for "
+                "associated Qos Policy %(qos_policy_id)s, just "
+                "support %(supported_types)s currently")
+
+
+class QosNotEnableForVPN(nexception.Conflict):
+    message = _("Can't not process Qos Policy request for VPN "
+                "service, as it's not enable.")
+
+
+class NotSupportedQosBwRuleDirection(nexception.Conflict):
+    message = _("Not Support direction %(direction)s bandwidth limit "
+                "rule associated with request "
+                "Qos Policy %(qos_policy_id)s")
+
+
 def _validate_subnet_list_or_none(data, key_specs=None):
     if data is not None:
         return validators.validate_subnet_list(data, key_specs)
@@ -230,7 +251,10 @@ RESOURCE_ATTRIBUTE_MAP = {
         'external_v6_ip': {'allow_post': False, 'allow_put': False,
                         'is_visible': True},
         'status': {'allow_post': False, 'allow_put': False,
-                   'is_visible': True}
+                   'is_visible': True},
+        'qos_policy_id': {'allow_post': True, 'allow_put': True,
+                          'validate': {'type:uuid_or_none': None},
+                          'is_visible': True, 'default': None}
     },
 
     'ipsec_site_connections': {

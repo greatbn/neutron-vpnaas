@@ -26,7 +26,6 @@ from neutron_lib.plugins import directory
 from neutron_vpnaas.db.vpn import vpn_models
 from neutron_vpnaas.services.vpn import service_drivers
 
-
 IPSEC = 'ipsec'
 BASE_IPSEC_VERSION = '1.0'
 
@@ -263,4 +262,18 @@ class BaseIPsecVPNDriver(service_drivers.VpnDriver):
         if not vpnservice.subnet:
             vpnservice_dict['subnet'] = {'cidr': subnet_cidr}
 
+        if vpnservice.qos_info:
+            qos_bw_rule = vpnservice.qos_info[0].qos_policy_bw_limit_rule
+            if qos_bw_rule:
+                vpnservice_dict['qos_policy'] = {
+                    'id': vpnservice.qos_info[0].qos_policy_id,
+                    'bw_limit_rule': {
+                        'id': qos_bw_rule.id,
+                        'max_kbps': qos_bw_rule.max_kbps,
+                        'max_burst_kbps': qos_bw_rule.max_burst_kbps,
+                        'direction': qos_bw_rule.direction}}
+            else:
+                vpnservice_dict['qos_policy'] = {
+                    'id': vpnservice.qos_info[0].qos_policy_id,
+                    'bw_limit_rule': None}
         return vpnservice_dict

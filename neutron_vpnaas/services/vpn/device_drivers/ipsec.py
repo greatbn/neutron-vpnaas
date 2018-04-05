@@ -44,8 +44,15 @@ import six
 
 from neutron_vpnaas._i18n import _
 from neutron_vpnaas.extensions import vpnaas
+from neutron_vpnaas.services.vpn.common import tc_htb_wrapper as tc_lib
 from neutron_vpnaas.services.vpn.common import topics
 from neutron_vpnaas.services.vpn import device_drivers
+
+from neutron.api.rpc.callbacks.consumer import registry
+from neutron.api.rpc.callbacks import events
+from neutron.api.rpc.callbacks import resources
+from neutron.api.rpc.handlers import resources_rpc
+
 
 LOG = logging.getLogger(__name__)
 TEMPLATE_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -808,7 +815,8 @@ class IPsecDriver(device_drivers.DeviceDriver):
     target = oslo_messaging.Target(version='1.0')
 
     def __init__(self, vpn_service, host):
-        # TODO(pc_m) Replace vpn_service with config arg, once all driver
+        # TODO(zhaobo)(pc_m) Replace vpn_service with config arg
+        # once all driver
         # implementations no longer need vpn_service.
         self.conf = vpn_service.conf
         self.host = host
@@ -829,6 +837,102 @@ class IPsecDriver(device_drivers.DeviceDriver):
             self.report_status, self.context)
         self.process_status_cache_check.start(
             interval=self.conf.ipsec.ipsec_status_check_interval)
+        # {qos_policy_id1: [bw_ruleA], qos_policy_id2: [bw_ruleB]}
+        self.managed_qos_policy_mappings = {}
+        # {qos_policy_id1: set([router_id1/process_id1, router_id2])}
+        self.vpn_process_qos_mappings = {}
+        self.resource_rpc = resources_rpc.ResourcesPullRpcApi()
+        self._register_qos_rpc_consumers()
+
+    @log_helpers.log_method_call
+    @lockutils.synchronized('vpn-agent', 'neutron-')
+    def _handle_notification(self, context, resource_type,
+                             qos_policies, event_type):
+        # self.rpc_notifications_required consider this is False, no qos
+        # backend driver need rpc. So this function may be not called never in
+        # this situation.
+        if event_type == events.UPDATED:
+            for qos_policy in qos_policies:
+                self._process_update_policy(context, qos_policy)
+
+    def _register_qos_rpc_consumers(self):
+        registry.register(self._handle_notification, resources.QOS_POLICY)
+
+        endpoints = [resources_rpc.ResourcesPushRpcCallback()]
+        topic = resources_rpc.resource_type_versioned_topic(
+            resources.QOS_POLICY)
+        self.conn.create_consumer(topic, endpoints, fanout=True)
+        self.conn.consume_in_threads()
+
+    def _check_qos_updated(self, orig_qos_rules, req_qos_rules):
+        new_rule = None
+        for rule in req_qos_rules:
+            if rule.rule_type in ['bandwidth_limit']:
+                new_rule = rule
+        if not new_rule and orig_qos_rules:
+            return True
+        elif not new_rule:
+            return False
+
+        ori_rule = orig_qos_rules[0]
+        for attr in ori_rule.fields:
+            if getattr(ori_rule, attr) != getattr(new_rule, attr):
+                return True
+        return False
+
+    def _process_update_policy(self, context, qos_policy):
+        router_ids = self.vpn_process_qos_mappings.get(qos_policy.id, set([]))
+        if not router_ids:
+            # This means its a genaral qos update, it doesn't hold a vpn.
+            # So just return.
+            # TODO(zhaobo) Another case, after qos delele bw_rule, then
+            # create a new bw_rule, we need to process the new rules.
+            return
+        orig_qos_rules = self.managed_qos_policy_mappings.get(qos_policy.id)
+
+        if self._check_qos_updated(orig_qos_rules, qos_policy.rules):
+            sync_router_ids = []
+            qos_vpn_dicts = []
+            for router_id in router_ids:
+                ri = self.routers.get(router_id)
+                vpn_process = self.processes.get(router_id)
+                if not ri or not vpn_process:
+                    continue
+                vpn_ext_ip = vpn_process.vpnservice.get('external_ip')
+                sync_router_ids.append(router_id)
+                qos_vpn_dict = self._genarate_vpn_dict(
+                    qos_policy, router_id, vpn_ext_ip)
+                qos_vpn_dicts.append(qos_vpn_dict)
+            self.managed_qos_policy_mappings[qos_policy.id] = [
+                rule for rule in qos_policy.rules
+                if rule.rule_type == 'bandwidth_limit']
+            self.vpn_process_qos_mappings[qos_policy.id] = set(sync_router_ids)
+            self._sync_vpn_qos(context, qos_vpn_dicts, sync_router_ids,
+                               skip_sync_pull=True)
+
+    def _genarate_vpn_dict(self, qos, router_id, external_ip):
+        bw_rule = None
+        for rule in qos.rules:
+            if rule.rule_type == 'bandwidth_limit':
+                bw_rule = rule
+                break
+        if bw_rule:
+            result = {
+                'qos_policy': {
+                    'id': qos.id,
+                    'bw_limit_rule': {
+                        'id': bw_rule.id,
+                        'max_kbps': bw_rule.max_kbps,
+                        'max_burst_kbps': bw_rule.max_burst_kbps,
+                        'direction': bw_rule.direction
+                    }},
+                'router_id': router_id,
+                'external_ip': external_ip
+            }
+        else:
+            result = {'qos_policy': {'id': qos.id, 'bw_limit_rule': None},
+                      'router_id': router_id, 'external_ip': external_ip}
+        return result
 
     def get_namespace(self, router_id):
         """Get namespace of router.
@@ -842,7 +946,8 @@ class IPsecDriver(device_drivers.DeviceDriver):
         if not router:
             return
         # For DVR, use SNAT namespace
-        # TODO(pcm): Use router object method to tell if DVR, when available
+        # TODO(pcm): Use router object method to tell if DVR
+        #  when available
         if router.router['distributed']:
             return router.snat_namespace.name
         return router.ns_name
@@ -860,7 +965,7 @@ class IPsecDriver(device_drivers.DeviceDriver):
         it will return the snat_iptables_manager otherwise it will
         return the legacy iptables_manager.
         """
-        # TODO(pcm): Use router object method to tell if DVR, when available
+        # # TODO(pcm): Use router object method to tell if DVR, when available
         if router.router['distributed']:
             return router.snat_iptables_manager
         return router.iptables_manager
@@ -1107,7 +1212,135 @@ class IPsecDriver(device_drivers.DeviceDriver):
         self._delete_vpn_processes(sync_router_ids, router_ids)
         self._cleanup_stale_vpn_processes(router_ids)
 
+        self._sync_vpn_qos(context, vpnservices, sync_router_ids)
         self.report_status(context)
+
+    def reset_request_vpnservice_qos(self, context, vpnservices):
+        sync_qos_ids = set([
+            vpnservice['qos_policy']['id'] for vpnservice in vpnservices
+            if vpnservice.get('qos_policy', None)])
+        qos_objs = self.resource_rpc.bulk_pull(
+            context, resources.QOS_POLICY, filter_kwargs={'id': sync_qos_ids})
+        qos_objs_dict = {}
+        for obj in qos_objs:
+            qos_objs_dict[obj.id] = obj
+
+        for vpnservice in vpnservices:
+            if vpnservice.get('qos_policy', None):
+                qos_obj = qos_objs_dict[vpnservice['qos_policy']['id']]
+                update_rule = None
+                for rule in qos_obj.rules:
+                    if rule.rule_type in ["bandwidth_limit"]:
+                        update_rule = rule
+                        break
+                if update_rule:
+                    vpnservice['qos_policy'] = {
+                        'id': qos_obj.id,
+                        'bw_limit_rule': {
+                            'id': update_rule.id,
+                            'max_kbps': update_rule.max_kbps,
+                            'max_burst_kbps': update_rule.max_burst_kbps,
+                            'direction': update_rule.direction}
+                    }
+                    self.managed_qos_policy_mappings[qos_obj.id] = [
+                        update_rule]
+                    if self.vpn_process_qos_mappings.get(qos_obj.id, None):
+                        self.vpn_process_qos_mappings[qos_obj.id].add(
+                            vpnservice['router_id'])
+                    else:
+                        self.vpn_process_qos_mappings[qos_obj.id] = set([
+                            vpnservice['router_id']])
+                else:
+                    vpnservice['qos_policy'] = {
+                        'id': qos_obj.id,
+                        'bw_limit_rule': None}
+                    if qos_obj.id in self.managed_qos_policy_mappings:
+                        del self.managed_qos_policy_mappings[qos_obj.id]
+                        del self.vpn_process_qos_mappings[qos_obj.id]
+
+    def _sync_vpn_qos(self, context, vpnservices,
+                      sync_router_ids, skip_sync_pull=False):
+        # vpnservice_dict['qos_policy'] = {
+        #     'id': vpnservice.qos_info[0].qos_policy_id,
+        #     'bw_limit_rule': {
+        #         'id': qos_bw_rule.id,
+        #         'max_kbps': qos_bw_rule.max_kbps,
+        #         'max_burst_kbps': qos_bw_rule.max_burst_kbps,
+        #         'direction': qos_bw_rule.direction}}
+        if not skip_sync_pull:
+            self.reset_request_vpnservice_qos(context, vpnservices)
+        for vpnservice in vpnservices:
+            qos_details = vpnservice.get('qos_policy', None)
+            if vpnservice['router_id'] not in sync_router_ids:
+                continue
+            if not qos_details:
+                bw_rule = None
+            else:
+                bw_rule = vpnservice['qos_policy']['bw_limit_rule']
+            if vpnservice['router_id'] in self.processes:
+                ri = self.routers.get(vpnservice['router_id'])
+                tc_wrapper = self._get_tc_wrapper(ri)
+                if not tc_wrapper:
+                    continue
+                # match_details
+                # {
+                #     src_ipaddress: ip/prefix,
+                #     protocol: protocol_num
+                #  }
+                existing_cidrs = self._get_router_current_cidr(ri)
+                vpn_ext_cidr = self._get_vpn_external_cidr(
+                    vpnservice.get('external_ip'), ri)
+                import netaddr
+                if vpn_ext_cidr in existing_cidrs:
+                    vpn_ext_ip = netaddr.IPNetwork(
+                        vpnservice.get('external_ip'))
+                    # TODO(zhaobo) need to support ipv6.
+                    if vpn_ext_ip.version == 4:
+                        gw_ip_prefix = str(vpn_ext_ip)
+                        match_details = {'src_ipaddress': gw_ip_prefix,
+                                         'protocol': '50'}
+                        if bw_rule:
+                            tc_wrapper.set_u32_rate_limit(
+                                match_details, bw_rule['max_kbps'],
+                                bw_rule['max_burst_kbps'])
+                        else:
+                            tc_wrapper.clear_u32_rate_limit(match_details)
+
+    def _get_vpn_external_cidr(self, vpn_ext_ip, ri):
+        ex_gw_port = ri.get_ex_gw_port()
+        import netaddr
+        for subnet in ex_gw_port['subnets']:
+            if netaddr.IPNetwork(vpn_ext_ip) in netaddr.IPNetwork(
+                    subnet['cidr']):
+                prefix = subnet['cidr'].split('/')[1]
+                return vpn_ext_ip + '/' + prefix
+
+    def _get_tc_wrapper(self, ri):
+        ns = self.get_namespace(ri.router_id)
+        ex_gw_port = ri.get_ex_gw_port()
+        if not ex_gw_port:
+            return
+        is_distributed_router = ri.router.get('distributed')
+        if is_distributed_router:
+            name = ri.get_snat_external_device_interface_name(
+                ex_gw_port)
+        else:
+            name = ri.get_external_device_interface_name(ex_gw_port)
+        if not name:
+            return
+        return tc_lib.VpnTcCommand(name, namespace=ns)
+
+    def _get_router_current_cidr(self, ri):
+        ns = self.get_namespace(ri.router_id)
+        ex_gw_port = ri.get_ex_gw_port()
+        is_distributed_router = ri.router.get('distributed')
+        if is_distributed_router:
+            name = ri.get_snat_external_device_interface_name(
+                ex_gw_port)
+        else:
+            name = ri.get_external_device_interface_name(ex_gw_port)
+        device = ip_lib.IPDevice(name, namespace=ns)
+        return ri.get_router_cidrs(device)
 
     def _sync_vpn_processes(self, vpnservices, sync_router_ids):
         # Ensure the ipsec process is enabled only for

@@ -20,7 +20,7 @@ from sqlalchemy import orm
 
 from neutron.db.models import l3
 from neutron.db import models_v2
-
+from neutron.db.qos import models as qos_models
 from neutron_vpnaas.services.vpn.common import constants
 
 
@@ -186,3 +186,26 @@ class VPNEndpointGroup(model_base.BASEV2, model_base.HasId,
                                  backref='endpoint_group',
                                  lazy='joined',
                                  cascade='all, delete, delete-orphan')
+
+
+class QosVPNServerPolicyBinding(model_base.BASEV2):
+    __tablename__ = 'qos_vpnservice_policy_bindings'
+    qos_policy_id = sa.Column(
+        sa.String(36), sa.ForeignKey('qos_policies.id', ondelete="CASCADE"),
+        nullable=False, primary_key=True)
+    vpn_service_id = sa.Column(
+        sa.String(36), sa.ForeignKey('vpnservices.id', ondelete="CASCADE"),
+        nullable=False, primary_key=True)
+    qos_policy = orm.relationship(qos_models.QosPolicy)
+    qos_policy_bw_limit_rule = orm.relationship(
+        "QosBandwidthLimitRule",
+        primaryjoin='QosVPNServerPolicyBinding.qos_policy_id=='
+                    'QosBandwidthLimitRule.qos_policy_id',
+        foreign_keys=qos_policy_id)
+    qos_info = orm.relationship('VPNService',
+            backref=sa.orm.backref('qos_info', cascade='delete'))
+    __table_args__ = (
+        sa.UniqueConstraint(
+            'vpn_service_id', 'qos_policy_id',
+            name='vpn_service_id0qos_policy_id_constraint'),
+    )
